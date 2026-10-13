@@ -37,6 +37,7 @@ const char *sdCardTypeName(uint8_t cardType);
 
 #define SD_SPI_SPEED 20000000L      // 20Mhz - more reliable for SD cards on CYD
 #define ENABLE_SD_DIAGNOSTICS true  // Enable diagnostics to help troubleshoot SD issues
+#define RANDOM_PLAYBACK false       // Set true to shuffle the playlist once per cycle
 
 // SD.open() adds the /sd mount point internally; paths here start at the card root.
 const char *MJPEG_FOLDER = "/mjpeg";
@@ -45,8 +46,10 @@ const char *MJPEG_FOLDER = "/mjpeg";
 #define MAX_FILES 20 // Maximum number of files, adjust as needed
 String mjpegFileList[MAX_FILES];
 uint32_t mjpegFileSizes[MAX_FILES] = {0}; // Store each GIF file's size in bytes
+int playbackOrder[MAX_FILES];
 int mjpegCount = 0;
 static int currentMjpegIndex = 0;
+static int playbackPosition = 0;
 static bool playbackReady = false;
 static fs::File mjpegFile; // temp gif file holder
 
@@ -68,6 +71,8 @@ Arduino_GFX *gfx = new Arduino_ILI9341(bus);
 
 // SD Card reader is on a separate SPI
 SPIClass sd_spi(VSPI);
+
+void shufflePlaybackOrder();
 
 // Interrupt to skip to the next mjpeg when the boot button is pressed
 volatile bool skipRequested = false; // set in ISR, read in loop()
@@ -131,6 +136,11 @@ void setup()
         return;
     }
 
+    if (RANDOM_PLAYBACK)
+    {
+        shufflePlaybackOrder();
+    }
+
     // Buffer allocation for mjpeg playing
     Serial.println("Buffer allocation");
     output_buf_size = gfx->width() * 4 * 2;
@@ -168,11 +178,39 @@ void loop()
         delay(1000);
         return;
     }
+
+    if (RANDOM_PLAYBACK)
+    {
+        if (playbackPosition >= mjpegCount)
+        {
+            shufflePlaybackOrder();
+            playbackPosition = 0;
+        }
+        playSelectedMjpeg(playbackOrder[playbackPosition++]);
+        return;
+    }
+
     playSelectedMjpeg(currentMjpegIndex);
     currentMjpegIndex++;
     if (currentMjpegIndex >= mjpegCount)
     {
         currentMjpegIndex = 0;
+    }
+}
+
+void shufflePlaybackOrder()
+{
+    for (int i = 0; i < mjpegCount; i++)
+    {
+        playbackOrder[i] = i;
+    }
+
+    for (int i = mjpegCount - 1; i > 0; i--)
+    {
+        int swapIndex = random(i + 1);
+        int currentIndex = playbackOrder[i];
+        playbackOrder[i] = playbackOrder[swapIndex];
+        playbackOrder[swapIndex] = currentIndex;
     }
 }
 

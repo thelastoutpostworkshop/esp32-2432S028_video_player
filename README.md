@@ -15,7 +15,7 @@ This project turns the ESP32-2432S028 "Cheap Yellow Display" (2.8" or 2.4") with
 ## Features
 - Plays `.mjpeg` videos directly from the SD card on the ESP32-2432S028
 - Automatically scans the `/mjpeg` folder and builds a playlist from the files it finds
-- Loops through all detected videos continuously
+- Loops through all detected videos continuously in sequential or randomized order
 - Lets the user skip to the next video with the onboard `BOOT` button
 - Uses the Arduino GFX and JPEGDEC libraries for MJPEG decoding and display output
 - Initializes the display and SD card independently for reliable playback on the CYD hardware
@@ -29,6 +29,7 @@ This project turns the ESP32-2432S028 "Cheap Yellow Display" (2.8" or 2.4") with
 - `BOOT_PIN` and `BOOT_BUTTON_DEBOUCE_TIME`: remap or adjust the skip button behavior
 - `SD_CS`, `SD_MISO`, `SD_MOSI`, `SD_SCK`, and `SD_SPI_SPEED`: adapt SD card wiring or bus speed if needed
 - `ENABLE_SD_DIAGNOSTICS`: enabled by default; set to `false` to disable detailed startup SD diagnostics
+- `RANDOM_PLAYBACK`: set to `true` to shuffle the playlist; each video plays once per cycle before reshuffling. Defaults to `false` for sequential playback
 - `MJPEG_FOLDER`: point the sketch to a different folder name on the SD card
 - `MAX_FILES`: increase or decrease the maximum number of videos loaded into the playlist
 - `gfx->setRotation(0)`: change screen orientation to match your enclosure or video layout
