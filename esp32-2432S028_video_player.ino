@@ -3,8 +3,22 @@
 
 #include <Arduino_GFX_Library.h> // Install "GFX Library for Arduino" with the Library Manager (last tested on v1.6.0)
                                  // Install "JPEGDEC" with the Library Manager (last tested on v1.8.2)
+#include <JPEGDEC.h>             // For JPEGDRAW struct definition
 #include "MjpegClass.h"          // Included in this project
 #include "SD.h"                  // Included with the Espressif Arduino Core (last tested on v3.2.0)
+
+// Forward declarations for functions used before definition
+void runSdDiagnostics();
+bool loadMjpegFilesList();
+void showCenteredMessage(const char *const lines[], uint8_t lineCount);
+String buildMjpegPath(const String &fileName);
+bool isMjpegVideoFileName(const String &fileName);
+void printFileReadTest(fs::File &file);
+String formatBytes(size_t bytes);
+void mjpegPlayFromSDCard(char *mjpegFilename);
+void playSelectedMjpeg(int mjpegIndex);
+int jpegDrawCallback(JPEGDRAW *pDraw);
+const char *sdCardTypeName(uint8_t cardType);
 
 // Pins for the display
 #define BL_PIN 21 // On some cheap yellow display model, BL pin is 27
@@ -21,10 +35,11 @@
 #define DISPLAY_SPI_SPEED 80000000L // 80MHz 
 
 
-#define SD_SPI_SPEED 80000000L      // 80Mhz
-#define ENABLE_SD_DIAGNOSTICS false // Prints SD card and file-open diagnostics to the Serial Monitor
+#define SD_SPI_SPEED 20000000L      // 20Mhz - more reliable for SD cards on CYD
+#define ENABLE_SD_DIAGNOSTICS true  // Enable diagnostics to help troubleshoot SD issues
 
-const char *MJPEG_FOLDER = "/mjpeg"; // Name of the mjpeg folder on the SD Card
+// SD.open() adds the /sd mount point internally; paths here start at the card root.
+const char *MJPEG_FOLDER = "/mjpeg";
 
 // Storage for files to read on the SD card
 #define MAX_FILES 20 // Maximum number of files, adjust as needed
@@ -32,7 +47,8 @@ String mjpegFileList[MAX_FILES];
 uint32_t mjpegFileSizes[MAX_FILES] = {0}; // Store each GIF file's size in bytes
 int mjpegCount = 0;
 static int currentMjpegIndex = 0;
-static File mjpegFile; // temp gif file holder
+static bool playbackReady = false;
+static fs::File mjpegFile; // temp gif file holder
 
 // Global variables for mjpeg
 MjpegClass mjpeg;
@@ -45,8 +61,9 @@ long output_buf_size, estimateBufferSize;
 uint8_t *mjpeg_buf;
 uint16_t *output_buf;
 
-// Display global variables
-Arduino_DataBus *bus = new Arduino_HWSPI(2 /* DC */, 15 /* CS */, 14 /* SCK */, 13 /* MOSI */, 12 /* MISO */);
+// Separate SPIClass objects must also use separate hardware hosts on this board.
+SPIClass display_spi(HSPI);
+Arduino_DataBus *bus = new Arduino_HWSPI(2 /* DC */, 15 /* CS */, 14 /* SCK */, 13 /* MOSI */, 12 /* MISO */, &display_spi);
 Arduino_GFX *gfx = new Arduino_ILI9341(bus);
 
 // SD Card reader is on a separate SPI
@@ -66,6 +83,8 @@ void IRAM_ATTR onButtonPress()
 void setup()
 {
     Serial.begin(115200);
+    delay(100);
+    Serial.println("\n\n=== ESP32-2432S028 Video Player Starting ===");
 
     // Set display backlight to High
     pinMode(BL_PIN, OUTPUT);
@@ -84,20 +103,33 @@ void setup()
     gfx->setRotation(0);
     gfx->fillScreen(RGB565_BLACK);
     // gfx->invertDisplay(true); // on some cheap yellow models, display must be inverted
-    Serial.printf("Screeen size Width=%d,Height=%d\n", gfx->width(), gfx->height());
+    Serial.printf("Screen size Width=%d,Height=%d\n", gfx->width(), gfx->height());
 
     // SD card initialization
-    Serial.println("SD Card initialization");
+    Serial.println("SD Card initialization (display=HSPI, SD=VSPI)");
     sd_spi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-    if (!SD.begin(SD_CS, sd_spi, SD_SPI_SPEED, "/sd"))
+    if (!SD.begin(SD_CS, sd_spi, SD_SPI_SPEED, "/sd") || SD.cardType() == CARD_NONE)
     {
-        Serial.println("ERROR: File system mount failed!");
-        while (true)
-        {
-            /* no need to continue */
-        }
+        Serial.println("ERROR: SD card not found or file system mount failed!");
+        const char *lines[] = {"SD card not found", "Insert/check card", "and reset device."};
+        showCenteredMessage(lines, sizeof(lines) / sizeof(lines[0]));
+        return;
     }
+    Serial.printf("SD Card mounted at /sd; video folder on card: %s\n", MJPEG_FOLDER);
     runSdDiagnostics();
+
+    if (!loadMjpegFilesList())
+    {
+        const char *lines[] = {
+            "No playable files",
+            "",
+            "Verify .mjpeg files",
+            "in the SD card's",
+            MJPEG_FOLDER,
+            "folder, then reset."};
+        showCenteredMessage(lines, sizeof(lines) / sizeof(lines[0]));
+        return;
+    }
 
     // Buffer allocation for mjpeg playing
     Serial.println("Buffer allocation");
@@ -122,21 +154,49 @@ void setup()
         }
     }
 
-    loadMjpegFilesList(); // Load the list of mjpeg to play from the SD card
-
     // Set the boot button to skip the current mjpeg playing and go to the next
     pinMode(BOOT_PIN, INPUT);                        
     attachInterrupt(digitalPinToInterrupt(BOOT_PIN), // fast ISR
                     onButtonPress, FALLING);         // press == LOW
+    playbackReady = true;
 }
 
 void loop()
 {
+    if (!playbackReady)
+    {
+        delay(1000);
+        return;
+    }
     playSelectedMjpeg(currentMjpegIndex);
     currentMjpegIndex++;
     if (currentMjpegIndex >= mjpegCount)
     {
         currentMjpegIndex = 0;
+    }
+}
+
+void showCenteredMessage(const char *const lines[], uint8_t lineCount)
+{
+    const uint8_t textSize = 2;
+    const int16_t lineSpacing = 8 * textSize + 4;
+    int16_t y = (gfx->height() - (lineCount - 1) * lineSpacing) / 2;
+
+    gfx->fillScreen(RGB565_BLACK);
+    gfx->setFont();
+    gfx->setTextSize(textSize);
+    gfx->setTextColor(RGB565_WHITE);
+    gfx->setTextWrap(false);
+    for (uint8_t i = 0; i < lineCount; i++)
+    {
+        int16_t x1, y1;
+        uint16_t w, h;
+        gfx->getTextBounds(lines[i], 0, 0, &x1, &y1, &w, &h);
+        gfx->setCursor(
+            gfx->width() / 2 - w / 2 - x1,
+            y - h / 2 - y1);
+        gfx->print(lines[i]);
+        y += lineSpacing;
     }
 }
 
@@ -165,68 +225,84 @@ int jpegDrawCallback(JPEGDRAW *pDraw)
 void mjpegPlayFromSDCard(char *mjpegFilename)
 {
     Serial.printf("Opening %s\n", mjpegFilename);
-    File mjpegFile = SD.open(mjpegFilename, "r");
+    
+    File mjpegFile = SD.open(mjpegFilename, FILE_READ);
 
     if (!mjpegFile || mjpegFile.isDirectory())
     {
         Serial.printf("ERROR: Failed to open %s file for reading\n", mjpegFilename);
+        Serial.printf("  File object valid: %d, isDirectory: %d\n", (bool)mjpegFile, mjpegFile.isDirectory());
+        return;
     }
-    else
+    
+    Serial.printf("File opened successfully, size: %lu bytes\n", mjpegFile.size());
+    Serial.println("MJPEG start");
+    gfx->fillScreen(RGB565_BLACK);
+
+    start_ms = millis();
+    curr_ms = millis();
+    total_frames = 0;
+    total_read_video = 0;
+    total_decode_video = 0;
+    total_show_video = 0;
+
+    if (!mjpeg.setup(
+        &mjpegFile, mjpeg_buf, jpegDrawCallback, true /* useBigEndian */,
+        0 /* x */, 0 /* y */, gfx->width() /* widthLimit */, gfx->height() /* heightLimit */))
     {
-        Serial.println("MJPEG start");
-        gfx->fillScreen(RGB565_BLACK);
-
-        start_ms = millis();
-        curr_ms = millis();
-        total_frames = 0;
-        total_read_video = 0;
-        total_decode_video = 0;
-        total_show_video = 0;
-
-        mjpeg.setup(
-            &mjpegFile, mjpeg_buf, jpegDrawCallback, true /* useBigEndian */,
-            0 /* x */, 0 /* y */, gfx->width() /* widthLimit */, gfx->height() /* heightLimit */);
-
-        while (!skipRequested && mjpegFile.available() && mjpeg.readMjpegBuf())
-        {
-            // Read video
-            total_read_video += millis() - curr_ms;
-            curr_ms = millis();
-
-            // Play video
-            mjpeg.drawJpg();
-            total_decode_video += millis() - curr_ms;
-
-            curr_ms = millis();
-            total_frames++;
-        }
-        /* We exited because the button was pressed or the video ended */
-        if (skipRequested) // pressed?
-        {
-            uint32_t now = millis(); // safe here
-            if (now - lastPress < BOOT_BUTTON_DEBOUCE_TIME)
-            {
-                // ignore if it was within the debounce time
-            }
-            else
-            {
-                lastPress = now;
-            }
-        }
-        skipRequested = false;
-
-        int time_used = millis() - start_ms;
-        Serial.println(F("MJPEG end"));
+        Serial.printf("ERROR: MJPEG reader initialization failed for %s\n", mjpegFilename);
         mjpegFile.close();
-        skipRequested = false; // ready for next video
-        float fps = 1000.0 * total_frames / time_used;
-        total_decode_video -= total_show_video;
-        Serial.printf("Total frames: %d\n", total_frames);
-        Serial.printf("Time used: %d ms\n", time_used);
-        Serial.printf("Average FPS: %0.1f\n", fps);
-        Serial.printf("Read MJPEG: %lu ms (%0.1f %%)\n", total_read_video, 100.0 * total_read_video / time_used);
-        Serial.printf("Decode video: %lu ms (%0.1f %%)\n", total_decode_video, 100.0 * total_decode_video / time_used);
-        Serial.printf("Show video: %lu ms (%0.1f %%)\n", total_show_video, 100.0 * total_show_video / time_used);
+        return;
+    }
+
+    while (!skipRequested && mjpegFile.available() && mjpeg.readMjpegBuf())
+    {
+        // Read video
+        total_read_video += millis() - curr_ms;
+        curr_ms = millis();
+
+        // Play video
+        mjpeg.drawJpg();
+        total_decode_video += millis() - curr_ms;
+
+        curr_ms = millis();
+        total_frames++;
+    }
+    /* We exited because the button was pressed or the video ended */
+    if (skipRequested) // pressed?
+    {
+        uint32_t now = millis(); // safe here
+        if (now - lastPress < BOOT_BUTTON_DEBOUCE_TIME)
+        {
+            // ignore if it was within the debounce time
+        }
+        else
+        {
+            lastPress = now;
+        }
+    }
+    if (total_frames == 0 && !skipRequested)
+    {
+        Serial.printf("ERROR: No complete JPEG frame read from %s (position=%lu, size=%lu)\n",
+                      mjpegFilename, (unsigned long)mjpegFile.position(), (unsigned long)mjpegFile.size());
+    }
+    skipRequested = false;
+
+    unsigned long time_used = millis() - start_ms;
+    Serial.println(F("MJPEG end"));
+    mjpegFile.close();
+    skipRequested = false; // ready for next video
+    float percent_per_ms = time_used > 0 ? 100.0 / time_used : 0.0;
+    float fps = time_used > 0 ? 1000.0 * total_frames / time_used : 0.0;
+    total_decode_video -= total_show_video;
+    Serial.printf("Total frames: %d\n", total_frames);
+    Serial.printf("Time used: %lu ms\n", time_used);
+    Serial.printf("Average FPS: %0.1f\n", fps);
+    Serial.printf("Read MJPEG: %lu ms (%0.1f %%)\n", total_read_video, total_read_video * percent_per_ms);
+    Serial.printf("Decode video: %lu ms (%0.1f %%)\n", total_decode_video, total_decode_video * percent_per_ms);
+    Serial.printf("Show video: %lu ms (%0.1f %%)\n", total_show_video, total_show_video * percent_per_ms);
+    if (total_frames > 0)
+    {
         Serial.printf("Video size (wxh): %d×%d, scale factor=%d\n",mjpeg.getWidth(),mjpeg.getHeight(),mjpeg.getScale());
     }
 }
@@ -268,7 +344,7 @@ bool isMjpegVideoFileName(const String &fileName)
     return baseName.endsWith(".mjpeg") && !baseName.startsWith("._");
 }
 
-void printFileReadTest(File &file)
+void printFileReadTest(fs::File &file)
 {
     uint8_t bytes[4] = {0, 0, 0, 0};
     int bytesRead = file.read(bytes, sizeof(bytes));
@@ -340,7 +416,9 @@ void runSdDiagnostics()
         return;
     }
 
-    Serial.printf("Direct-open test: %s\n", firstMjpegPath.c_str());
+    Serial.println("Writing to display before SD direct-open test");
+    gfx->fillScreen(RGB565_BLACK);
+    Serial.printf("Direct-open test after display write: %s\n", firstMjpegPath.c_str());
     File directFile = SD.open(firstMjpegPath.c_str(), FILE_READ);
     if (!directFile || directFile.isDirectory())
     {
@@ -356,18 +434,21 @@ void runSdDiagnostics()
 }
 
 // Read the mjpeg file list in the mjpeg folder of the SD card
-void loadMjpegFilesList()
+bool loadMjpegFilesList()
 {
+    mjpegCount = 0;
     File mjpegDir = SD.open(MJPEG_FOLDER);
     if (!mjpegDir)
     {
-        Serial.printf("Failed to open %s folder\n", MJPEG_FOLDER);
-        while (true)
-        {
-            /* code */
-        }
+        Serial.printf("ERROR: Failed to open %s folder\n", MJPEG_FOLDER);
+        return false;
     }
-    mjpegCount = 0;
+    if (!mjpegDir.isDirectory())
+    {
+        Serial.printf("ERROR: %s is not a folder\n", MJPEG_FOLDER);
+        mjpegDir.close();
+        return false;
+    }
     while (true)
     {
         File file = mjpegDir.openNextFile();
@@ -378,14 +459,21 @@ void loadMjpegFilesList()
             String name = file.name();
             if (isMjpegVideoFileName(name))
             {
-                mjpegFileList[mjpegCount] = name;
-                mjpegFileSizes[mjpegCount] = file.size(); // Save file size (in bytes)
-                mjpegCount++;
-                if (mjpegCount >= MAX_FILES)
-                    break;
+                if (file.size() == 0)
+                {
+                    Serial.printf("WARNING: Skipping empty MJPEG file: %s\n", name.c_str());
+                }
+                else
+                {
+                    mjpegFileList[mjpegCount] = buildMjpegPath(name);
+                    mjpegFileSizes[mjpegCount] = file.size();
+                    mjpegCount++;
+                }
             }
         }
         file.close();
+        if (mjpegCount >= MAX_FILES)
+            break;
     }
     mjpegDir.close();
     Serial.printf("%d mjpeg files read\n", mjpegCount);
@@ -394,6 +482,11 @@ void loadMjpegFilesList()
     {
         Serial.printf("File %d: %s, Size: %lu bytes (%s)\n", i, mjpegFileList[i].c_str(), mjpegFileSizes[i],formatBytes(mjpegFileSizes[i]).c_str());
     }
+    if (mjpegCount == 0)
+    {
+        Serial.printf("ERROR: No non-empty .mjpeg files found in %s\n", MJPEG_FOLDER);
+    }
+    return mjpegCount > 0;
 }
 
 // Function helper display sizes on the serial monitor
